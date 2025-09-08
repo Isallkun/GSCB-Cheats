@@ -63,15 +63,52 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
   --role roles/eventarc.eventReceiver
 
-# ====== IMPORTANT: grant Logs Writer (fix your error) ======
+# ====== IMPORTANT: Logs Writer (fixes original logging error) ======
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
   --role roles/logging.logWriter
 
-# (Recommended) Cloud Build SA also gets Logs Writer
+# Cloud Build SA also gets Logs Writer
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
   --role roles/logging.logWriter
+
+# ===== Build SA & source buckets permissions (fixes build failure) =====
+echo
+echo "${COLOR_BLUE}${BOLD}Granting build permissions for Cloud Functions Gen2...${COLOR_RESET}"
+
+# Allow Cloud Build SA to push images to Artifact Registry
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member "serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
+  --role roles/artifactregistry.writer
+
+# Grant objectViewer on ALL gcf-v2-sources buckets (any region you've used)
+# to BOTH the Compute default SA and the Cloud Build SA.
+echo "${COLOR_BLUE}Scanning gcf-v2-sources buckets and granting objectViewer...${COLOR_RESET}"
+for b in $(gsutil ls -p "$PROJECT_ID" 2>/dev/null | grep "gs://gcf-v2-sources-${PROJECT_NUMBER}-" || true); do
+  echo " - $b"
+  gsutil iam ch \
+    serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com:objectViewer \
+    "$b" || true
+  gsutil iam ch \
+    serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com:objectViewer \
+    "$b" || true
+done
+
+# If you know the deploy region is different from $REGION (e.g. us-east1 from logs),
+# also grant explicitly just in case bucket list is delayed.
+for extra_region in "$REGION" "us-east1"; do
+  b="gs://gcf-v2-sources-${PROJECT_NUMBER}-${extra_region}"
+  if gsutil ls "$b" >/dev/null 2>&1; then
+    echo "Ensuring objectViewer on $b"
+    gsutil iam ch \
+      serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com:objectViewer \
+      "$b" || true
+    gsutil iam ch \
+      serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com:objectViewer \
+      "$b" || true
+  fi
+done
 
 # ===== Audit logs for compute (append safely, using jq) =====
 echo
