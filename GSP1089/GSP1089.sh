@@ -19,7 +19,7 @@ BLINK=$'\033[5m'
 REVERSE=$'\033[7m'
 
 clear
-# Welcome message (fixed undefined vars)
+# Welcome message
 echo "${COLOR_BLUE}${BOLD}=======================================${COLOR_RESET}"
 echo "${COLOR_BLUE}${BOLD}         INITIATING EXECUTION...       ${COLOR_RESET}"
 echo "${COLOR_BLUE}${BOLD}=======================================${COLOR_RESET}"
@@ -71,22 +71,36 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
   --role roles/eventarc.eventReceiver
 
-# >>> Fix: allow writing logs to Cloud Logging (root cause of your error)
+# ===== Fixes: Logging & Build permissions =====
+# Allow Compute Default SA to write logs
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
   --role roles/logging.logWriter
 
-# (Recommended) Cloud Build SA can also write logs
+# ---- Build roles for Compute Default SA (if masih dipakai di tempat lain)
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member "serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --role roles/cloudbuild.builds.builder
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member "serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --role roles/artifactregistry.writer
+
+# ---- Preferred: pakai Cloud Build SA sebagai build service account
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
-  --role roles/logging.logWriter
+  --role roles/cloudbuild.builds.builder
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member "serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
+  --role roles/artifactregistry.writer
 
 # Verify the binding
 echo
-echo "${COLOR_CYAN}${BOLD}Verifying logging.logWriter role on service accounts...${COLOR_RESET}"
+echo "${COLOR_CYAN}${BOLD}Verifying builder & AR writer roles...${COLOR_RESET}"
 gcloud projects get-iam-policy "$PROJECT_ID" \
   --flatten="bindings[].members" \
-  --filter="bindings.role=roles/logging.logWriter AND (bindings.members:serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com OR bindings.members:serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com)" \
+  --filter="bindings.role:(roles/cloudbuild.builds.builder roles/artifactregistry.writer roles/logging.logWriter) AND (bindings.members:serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com OR bindings.members:serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com)" \
   --format="table(bindings.role,bindings.members)"
 
 # ===== Update IAM Audit Policy (optional; keep from original) =====
@@ -100,6 +114,25 @@ auditConfigs:
   service: compute.googleapis.com
 EOF
 gcloud projects set-iam-policy "$PROJECT_ID" policy.yaml
+
+# ===== Deploy helper (with --quiet + build SA) =====
+deploy_with_retry() {
+  local function_name="$1"; shift
+  local attempts=0
+  local max_attempts=5
+  while (( attempts < max_attempts )); do
+    echo "${COLOR_YELLOW}${BOLD}Attempt $((attempts+1)): Deploying ${function_name}...${COLOR_RESET}"
+    if gcloud functions deploy "${function_name}" --quiet --build-service-account="${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" "$@"; then
+      echo "${COLOR_GREEN}${BOLD}${function_name} deployed successfully!${COLOR_RESET}"
+      return 0
+    fi
+    attempts=$((attempts+1))
+    echo "${COLOR_RED}${BOLD}Deployment failed. Retrying in 30 seconds...${COLOR_RESET}"
+    sleep 30
+  done
+  echo "${COLOR_RED}${BOLD}Failed to deploy ${function_name} after ${max_attempts} attempts${COLOR_RESET}"
+  return 1
+}
 
 # ===== Deploy HTTP Function (Node.js 22, Gen2) =====
 echo
@@ -121,24 +154,6 @@ cat > package.json <<'EOF'
   }
 }
 EOF
-
-deploy_with_retry() {
-  local function_name="$1"; shift
-  local attempts=0
-  local max_attempts=5
-  while (( attempts < max_attempts )); do
-    echo "${COLOR_YELLOW}${BOLD}Attempt $((attempts+1)): Deploying ${function_name}...${COLOR_RESET}"
-    if gcloud functions deploy "${function_name}" "$@"; then
-      echo "${COLOR_GREEN}${BOLD}${function_name} deployed successfully!${COLOR_RESET}"
-      return 0
-    fi
-    attempts=$((attempts+1))
-    echo "${COLOR_RED}${BOLD}Deployment failed. Retrying in 30 seconds...${COLOR_RESET}"
-    sleep 30
-  done
-  echo "${COLOR_RED}${BOLD}Failed to deploy ${function_name} after ${max_attempts} attempts${COLOR_RESET}"
-  return 1
-}
 
 deploy_with_retry nodejs-http-function \
   --gen2 \
@@ -269,7 +284,7 @@ def hello_world(request):
     color = os.environ.get('COLOR', 'white')
     return f'<body style="background-color:{color}"><h1>Hello World!</h1></body>'
 EOF
-# NOTE: Ganti python311 -> python39 jika region/runtime belum support 3.11
+# NOTE: Ganti python311 -> python39/python312 jika region/runtime berbeda
 deploy_with_retry hello-world-colored \
   --gen2 \
   --runtime python311 \
