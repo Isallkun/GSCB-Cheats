@@ -58,49 +58,38 @@ gcloud config set compute/region "$REGION" >/dev/null
 gcloud config set compute/zone "$ZONE" >/dev/null
 
 # ===== Configure IAM =====
-# KMS service account for this project (needed if you use KMS/AR keys later)
+COMPUTE_DEFAULT_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 SERVICE_ACCOUNT_KMS="$(gsutil kms serviceaccount -p "${PROJECT_NUMBER}")"
 
-# Pub/Sub publisher for KMS SA (as in your original script)
+# Pub/Sub publisher for KMS SA (dari skrip awalmu)
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${SERVICE_ACCOUNT_KMS}" \
-  --role roles/pubsub.publisher
+  --role roles/pubsub.publisher || true
 
-# Eventarc eventReceiver for Compute Default SA (needed by some audit log triggers)
+# Eventarc receiver wajib untuk Compute SA
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member "serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
-  --role roles/eventarc.eventReceiver
+  --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
+  --role roles/eventarc.eventReceiver || true
 
-# ===== Fixes: Logging & Build permissions =====
-# Allow Compute Default SA to write logs
+# ===== Fixes: Logging & Build permissions (Compute Default SA) =====
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member "serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
-  --role roles/logging.logWriter
-
-# ---- Build roles for Compute Default SA (if masih dipakai di tempat lain)
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member "serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
-  --role roles/cloudbuild.builds.builder
+  --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
+  --role roles/logging.logWriter || true
 
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member "serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
-  --role roles/artifactregistry.writer
-
-# ---- Preferred: pakai Cloud Build SA sebagai build service account
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member "serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
-  --role roles/cloudbuild.builds.builder
+  --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
+  --role roles/cloudbuild.builds.builder || true
 
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member "serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
-  --role roles/artifactregistry.writer
+  --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
+  --role roles/artifactregistry.writer || true
 
-# Verify the binding
+# Cek cepat
 echo
-echo "${COLOR_CYAN}${BOLD}Verifying builder & AR writer roles...${COLOR_RESET}"
+echo "${COLOR_CYAN}${BOLD}Verifying IAM bindings (builder/AR writer/logWriter)...${COLOR_RESET}"
 gcloud projects get-iam-policy "$PROJECT_ID" \
   --flatten="bindings[].members" \
-  --filter="bindings.role:(roles/cloudbuild.builds.builder roles/artifactregistry.writer roles/logging.logWriter) AND (bindings.members:serviceAccount:${PROJECT_NUMBER}-compute@developer.gserviceaccount.com OR bindings.members:serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com)" \
+  --filter="bindings.role:(roles/cloudbuild.builds.builder roles/artifactregistry.writer roles/logging.logWriter) AND bindings.members:serviceAccount:${COMPUTE_DEFAULT_SA}" \
   --format="table(bindings.role,bindings.members)"
 
 # ===== Update IAM Audit Policy (optional; keep from original) =====
@@ -115,14 +104,14 @@ auditConfigs:
 EOF
 gcloud projects set-iam-policy "$PROJECT_ID" policy.yaml
 
-# ===== Deploy helper (with --quiet + build SA) =====
+# ===== Deploy helper (NO build-service-account) =====
 deploy_with_retry() {
   local function_name="$1"; shift
   local attempts=0
   local max_attempts=5
   while (( attempts < max_attempts )); do
     echo "${COLOR_YELLOW}${BOLD}Attempt $((attempts+1)): Deploying ${function_name}...${COLOR_RESET}"
-    if gcloud functions deploy "${function_name}" --quiet --build-service-account="${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" "$@"; then
+    if gcloud functions deploy "${function_name}" --quiet "$@"; then
       echo "${COLOR_GREEN}${BOLD}${function_name} deployed successfully!${COLOR_RESET}"
       return 0
     fi
@@ -241,7 +230,7 @@ gcloud compute instances create instance-1 \
   --metadata=enable-osconfig=TRUE,enable-oslogin=true \
   --maintenance-policy=MIGRATE \
   --provisioning-model=STANDARD \
-  --service-account="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --service-account="${COMPUTE_DEFAULT_SA}" \
   --scopes="https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/trace.append" \
   --create-disk=auto-delete=yes,boot=yes,device-name=instance-1,image=projects/debian-cloud/global/images/debian-12-bookworm-v20250311,mode=rw,size=10,type=pd-balanced \
   --no-shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
@@ -284,7 +273,7 @@ def hello_world(request):
     color = os.environ.get('COLOR', 'white')
     return f'<body style="background-color:{color}"><h1>Hello World!</h1></body>'
 EOF
-# NOTE: Ganti python311 -> python39/python312 jika region/runtime berbeda
+# NOTE: Ganti python311 -> python39/python312 bila runtime berbeda di region
 deploy_with_retry hello-world-colored \
   --gen2 \
   --runtime python311 \
@@ -341,7 +330,7 @@ case "$user_input" in
   *)     echo "${COLOR_RED}${BOLD}Please complete Task 6 first${COLOR_RESET}";;
 esac
 
-# ===== Cleanup (Cloud Run service name adjusted if needed) =====
+# ===== Cleanup =====
 echo
 echo "${COLOR_BLUE}${BOLD}Cleaning Up Previous Deployment...${COLOR_RESET}"
 gcloud run services delete slow-function --region "$REGION" --quiet || true
