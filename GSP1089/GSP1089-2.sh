@@ -73,23 +73,28 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com" \
   --role roles/logging.logWriter
 
-# ===== Audit logs for compute (append safely) =====
+# ===== Audit logs for compute (append safely, using jq) =====
 echo
-echo "${COLOR_BLUE}${BOLD}Updating audit logging for Compute...${COLOR_RESET}"
+echo "${COLOR_BLUE}${BOLD}Updating audit logging for Compute (via jq)...${COLOR_RESET}"
 TMP_DIR="$(mktemp -d)"; trap 'rm -rf "$TMP_DIR"' EXIT
 gcloud projects get-iam-policy "$PROJECT_ID" --format=json > "$TMP_DIR/policy.json"
 
-# merge auditConfigs if missing
-python3 - "$TMP_DIR/policy.json" <<'PY'
-import json, sys
-p=json.load(open(sys.argv[1]))
-svc='compute.googleapis.com'
-cfg={ 'service': svc, 'auditLogConfigs':[{'logType':'ADMIN_READ'},{'logType':'DATA_READ'},{'logType':'DATA_WRITE'}]}
-if 'auditConfigs' not in p: p['auditConfigs']=[]
-if not any(ac.get('service')==svc for ac in p['auditConfigs']):
-    p['auditConfigs'].append(cfg)
-print(json.dumps(p,indent=2))
-PY > "$TMP_DIR/policy_new.json"
+jq '
+  .auditConfigs = (.auditConfigs // []) |
+  ( if any(.auditConfigs[]?; .service == "compute.googleapis.com")
+    then .
+    else .auditConfigs += [
+      {
+        "service": "compute.googleapis.com",
+        "auditLogConfigs": [
+          {"logType":"ADMIN_READ"},
+          {"logType":"DATA_READ"},
+          {"logType":"DATA_WRITE"}
+        ]
+      }
+    ] end
+  )
+' "$TMP_DIR/policy.json" > "$TMP_DIR/policy_new.json"
 
 gcloud projects set-iam-policy "$PROJECT_ID" "$TMP_DIR/policy_new.json" >/dev/null
 
