@@ -110,6 +110,40 @@ for extra_region in "$REGION" "us-east1"; do
   fi
 done
 
+# ===== Artifact Registry: ensure repo & grant access for builds =====
+echo
+echo "${COLOR_BLUE}${BOLD}Ensuring Artifact Registry 'gcf-artifacts' and granting access...${COLOR_RESET}"
+
+CF_SA="service-${PROJECT_NUMBER}@gcf-admin-robot.iam.gserviceaccount.com"
+CB_SA="${PROJECT_NUMBER}@cloudbuild.gserviceaccount.com"
+CE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+
+# Cover both your chosen REGION and us-east1 (as seen in logs)
+for ar_region in "$REGION" "us-east1"; do
+  # Create repo if missing (docker format)
+  if ! gcloud artifacts repositories describe gcf-artifacts --location="$ar_region" >/dev/null 2>&1; then
+    echo "Creating Artifact Registry repo 'gcf-artifacts' in $ar_region (if allowed)..."
+    gcloud artifacts repositories create gcf-artifacts \
+      --repository-format=docker \
+      --location="$ar_region" \
+      --description="GCF artifacts" || true
+  fi
+
+  # Grant reader + writer to Cloud Build SA, Compute default SA, and GCF service agent
+  for SA in "$CB_SA" "$CE_SA" "$CF_SA"; do
+    echo "Granting AR reader/writer on gcf-artifacts ($ar_region) to $SA"
+    gcloud artifacts repositories add-iam-policy-binding gcf-artifacts \
+      --location="$ar_region" \
+      --member="serviceAccount:$SA" \
+      --role="roles/artifactregistry.reader" || true
+
+    gcloud artifacts repositories add-iam-policy-binding gcf-artifacts \
+      --location="$ar_region" \
+      --member="serviceAccount:$SA" \
+      --role="roles/artifactregistry.writer" || true
+  done
+done
+
 # ===== Audit logs for compute (append safely, using jq) =====
 echo
 echo "${COLOR_BLUE}${BOLD}Updating audit logging for Compute (via jq)...${COLOR_RESET}"
