@@ -1,5 +1,7 @@
 #!/bin/bash
-# Enhanced Color Definitions
+set -euo pipefail
+
+# ===== Enhanced Color Definitions =====
 COLOR_BLACK=$'\033[0;30m'
 COLOR_RED=$'\033[0;31m'
 COLOR_GREEN=$'\033[0;32m'
@@ -18,9 +20,9 @@ REVERSE=$'\033[7m'
 
 clear
 # Welcome message
-echo "${BLUE_TEXT}${BOLD_TEXT}=======================================${RESET_FORMAT}"
-echo "${BLUE_TEXT}${BOLD_TEXT}         INITIATING EXECUTION...  ${RESET_FORMAT}"
-echo "${BLUE_TEXT}${BOLD_TEXT}=======================================${RESET_FORMAT}"
+echo "${COLOR_BLUE}${BOLD}=======================================${COLOR_RESET}"
+echo "${COLOR_BLUE}${BOLD}         INITIATING EXECUTION...       ${COLOR_RESET}"
+echo "${COLOR_BLUE}${BOLD}=======================================${COLOR_RESET}"
 echo
 
 # Enable GCP Services
@@ -37,15 +39,26 @@ gcloud services enable \
   pubsub.googleapis.com
 
 # Set Project Variables
-export PROJECT_ID=$(gcloud config get-value project)
-PROJECT_NUMBER=$(gcloud projects list --filter="project_id:$PROJECT_ID" --format='value(project_number)')
-export ZONE=$(gcloud compute project-info describe \
---format="value(commonInstanceMetadata.items[google-compute-default-zone])")
-export REGION=$(gcloud compute project-info describe \
---format="value(commonInstanceMetadata.items[google-compute-default-region])")
-gcloud config set compute/region $REGION
+export PROJECT_ID="$(gcloud config get-value project)"
+PROJECT_NUMBER="$(gcloud projects list --filter="project_id:${PROJECT_ID}" --format='value(project_number)')"
+export ZONE="$(gcloud compute project-info describe --format="value(commonInstanceMetadata.items[google-compute-default-zone])")"
+export REGION="$(gcloud compute project-info describe --format="value(commonInstanceMetadata.items[google-compute-default-region])")"
 
-# Configure IAM
+# Fallback REGION/ZONE kalau kosong
+if [[ -z "${REGION}" || -z "${ZONE}" ]]; then
+  ZONE="${ZONE:-$(gcloud config get-value compute/zone 2>/dev/null || true)}"
+  REGION="${REGION:-$(gcloud config get-value compute/region 2>/dev/null || true)}"
+  if [[ -z "${REGION}" && -n "${ZONE}" ]]; then REGION="${ZONE%-*}"; fi
+  REGION="${REGION:-us-central1}"
+  ZONE="${ZONE:-${REGION}-a}"
+fi
+gcloud config set compute/region "$REGION" >/dev/null
+gcloud config set compute/zone "$ZONE" >/dev/null
+
+COMPUTE_DEFAULT_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+EVENTARC_SA="service-${PROJECT_NUMBER}@gcp-sa-eventarc.iam.gserviceaccount.com"
+
+# Configure IAM (tambahan yang perlu)
 SERVICE_ACCOUNT="$(gsutil kms serviceaccount -p "${PROJECT_NUMBER}" 2>/dev/null || true)"
 if [[ -n "${SERVICE_ACCOUNT}" ]]; then
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
@@ -75,9 +88,10 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:${EVENTARC_SA}" \
   --role="roles/pubsub.publisher" --quiet || true
 
-# Update IAM Policy
-gcloud projects get-iam-policy $PROJECT_ID > policy.yaml
-cat <<EOF >> policy.yaml
+# Update IAM Policy (Audit logs for compute.googleapis.com)
+gcloud projects get-iam-policy "$PROJECT_ID" > policy.yaml
+if ! grep -q "service: compute.googleapis.com" policy.yaml; then
+cat <<'EOF' >> policy.yaml
 auditConfigs:
 - auditLogConfigs:
   - logType: ADMIN_READ
@@ -85,7 +99,30 @@ auditConfigs:
   - logType: DATA_WRITE
   service: compute.googleapis.com
 EOF
-gcloud projects set-iam-policy $PROJECT_ID policy.yaml
+fi
+gcloud projects set-iam-policy "$PROJECT_ID" policy.yaml >/dev/null
+
+# Helper deploy
+deploy_with_retry() {
+  local function_name=$1
+  shift
+  local attempts=0
+  local max_attempts=5
+  while [ $attempts -lt $max_attempts ]; do
+    echo "${COLOR_YELLOW}${BOLD}Attempt $((attempts+1)): Deploying $function_name...${COLOR_RESET}"
+    if gcloud functions deploy "$function_name" --quiet "$@"; then
+      echo "${COLOR_GREEN}${BOLD}$function_name deployed successfully!${COLOR_RESET}"
+      return 0
+    else
+      attempts=$((attempts+1))
+      echo "${COLOR_RED}${BOLD}Deployment failed. Retrying in 30 seconds...${COLOR_RESET}"
+      sleep 30
+    fi
+  done
+  echo "${COLOR_RED}${BOLD}Failed to deploy $function_name after $max_attempts attempts${COLOR_RESET}"
+  return 1
+}
+
 
 # Deploy HTTP Function
 echo
