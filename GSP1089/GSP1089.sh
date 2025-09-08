@@ -1,19 +1,33 @@
 #!/bin/bash
 set -euo pipefail
 
-# ===== Colors =====
-COLOR_RED=$'\033[0;31m'; COLOR_GREEN=$'\033[0;32m'; COLOR_YELLOW=$'\033[0;33m'
-COLOR_BLUE=$'\033[0;34m'; COLOR_CYAN=$'\033[0;36m'; COLOR_RESET=$'\033[0m'
-BOLD=$'\033[1m'; UNDERLINE=$'\033[4m'
+# ===== Enhanced Color Definitions =====
+COLOR_BLACK=$'\033[0;30m'
+COLOR_RED=$'\033[0;31m'
+COLOR_GREEN=$'\033[0;32m'
+COLOR_YELLOW=$'\033[0;33m'
+COLOR_BLUE=$'\033[0;34m'
+COLOR_MAGENTA=$'\033[0;35m'
+COLOR_CYAN=$'\033[0;36m'
+COLOR_WHITE=$'\033[0;37m'
+COLOR_RESET=$'\033[0m'
+
+# Text Formatting
+BOLD=$'\033[1m'
+UNDERLINE=$'\033[4m'
+BLINK=$'\033[5m'
+REVERSE=$'\033[7m'
 
 clear
+# Welcome message (fix undefined vars)
 echo "${COLOR_BLUE}${BOLD}=======================================${COLOR_RESET}"
 echo "${COLOR_BLUE}${BOLD}         INITIATING EXECUTION...       ${COLOR_RESET}"
 echo "${COLOR_BLUE}${BOLD}=======================================${COLOR_RESET}"
 echo
 
-# ===== Enable APIs =====
+# Enable GCP Services
 echo "${COLOR_BLUE}${BOLD}Enabling Required GCP Services...${COLOR_RESET}"
+echo
 gcloud services enable \
   artifactregistry.googleapis.com \
   cloudfunctions.googleapis.com \
@@ -24,13 +38,13 @@ gcloud services enable \
   osconfig.googleapis.com \
   pubsub.googleapis.com
 
-# ===== Project Vars =====
+# Set Project Variables
 export PROJECT_ID="$(gcloud config get-value project)"
 PROJECT_NUMBER="$(gcloud projects list --filter="project_id:${PROJECT_ID}" --format='value(project_number)')"
-
-# REGION/ZONE from metadata or fallback
 export ZONE="$(gcloud compute project-info describe --format="value(commonInstanceMetadata.items[google-compute-default-zone])")"
 export REGION="$(gcloud compute project-info describe --format="value(commonInstanceMetadata.items[google-compute-default-region])")"
+
+# Fallback REGION/ZONE bila metadata kosong
 if [[ -z "${REGION}" || -z "${ZONE}" ]]; then
   ZONE="${ZONE:-$(gcloud config get-value compute/zone 2>/dev/null || true)}"
   REGION="${REGION:-$(gcloud config get-value compute/region 2>/dev/null || true)}"
@@ -38,68 +52,90 @@ if [[ -z "${REGION}" || -z "${ZONE}" ]]; then
   REGION="${REGION:-us-central1}"
   ZONE="${ZONE:-${REGION}-a}"
 fi
+
 gcloud config set compute/region "$REGION" >/dev/null
 gcloud config set compute/zone "$ZONE" >/dev/null
 
 COMPUTE_DEFAULT_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
+EVENTARC_SA="service-${PROJECT_NUMBER}@gcp-sa-eventarc.iam.gserviceaccount.com"
 
-# ===== IAM Fixes (Build/Logs/AR) =====
-echo "${COLOR_BLUE}${BOLD}Configuring IAM for build & logging...${COLOR_RESET}"
+# Configure IAM (existing + fixes)
+SERVICE_ACCOUNT="$(gsutil kms serviceaccount -p "${PROJECT_NUMBER}" 2>/dev/null || true)"
+if [[ -n "${SERVICE_ACCOUNT}" ]]; then
+  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member "serviceAccount:${SERVICE_ACCOUNT}" \
+    --role roles/pubsub.publisher || true
+fi
+
+# Eventarc receiver for Compute Default SA (as in your script)
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
+  --role roles/eventarc.eventReceiver || true
+
+# === Fixes for build/logging/AR writer on Compute Default SA ===
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
+  --role roles/logging.logWriter || true
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
   --role roles/cloudbuild.builds.builder || true
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
   --role roles/artifactregistry.writer || true
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
-  --role roles/logging.logWriter || true
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
-  --role roles/eventarc.eventReceiver || true
 
-# (Opsional) Pub/Sub publisher untuk KMS SA—hanya jika tersedia
-SERVICE_ACCOUNT_KMS="$(gsutil kms serviceaccount -p "${PROJECT_NUMBER}" 2>/dev/null || true)"
-if [[ -n "${SERVICE_ACCOUNT_KMS}" ]]; then
-  gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-    --member "serviceAccount:${SERVICE_ACCOUNT_KMS}" \
-    --role roles/pubsub.publisher || true
+# === Eventarc Service Agent hardening ===
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:${EVENTARC_SA}" \
+  --role="roles/eventarc.serviceAgent" --quiet || true
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:${EVENTARC_SA}" \
+  --role="roles/pubsub.publisher" --quiet || true
+
+# Update IAM Policy (Audit logs for compute.googleapis.com)
+gcloud projects get-iam-policy "$PROJECT_ID" > policy.yaml
+# Tambah auditConfigs jika belum ada (append aman)
+if ! grep -q "service: compute.googleapis.com" policy.yaml; then
+cat <<'EOF' >> policy.yaml
+auditConfigs:
+- auditLogConfigs:
+  - logType: ADMIN_READ
+  - logType: DATA_READ
+  - logType: DATA_WRITE
+  service: compute.googleapis.com
+EOF
 fi
+gcloud projects set-iam-policy "$PROJECT_ID" policy.yaml >/dev/null
 
-# Verifikasi cepat
-echo
-echo "${COLOR_CYAN}${BOLD}Verifying IAM bindings...${COLOR_RESET}"
-gcloud projects get-iam-policy "$PROJECT_ID" \
-  --flatten="bindings[].members" \
-  --filter="bindings.role:(roles/cloudbuild.builds.builder roles/artifactregistry.writer roles/logging.logWriter) AND bindings.members:serviceAccount:${COMPUTE_DEFAULT_SA}" \
-  --format="table(bindings.role,bindings.members)"
-
-# ===== Helper Deploy (tanpa --build-service-account) =====
+# Helper deploy (pakai --quiet)
 deploy_with_retry() {
-  local function_name="$1"; shift
-  local attempts=0; local max_attempts=5
-  while (( attempts < max_attempts )); do
-    echo "${COLOR_YELLOW}${BOLD}Attempt $((attempts+1)): Deploying ${function_name}...${COLOR_RESET}"
-    if gcloud functions deploy "${function_name}" --quiet "$@"; then
-      echo "${COLOR_GREEN}${BOLD}${function_name} deployed successfully!${COLOR_RESET}"
+  local function_name=$1
+  shift
+  local attempts=0
+  local max_attempts=5
+  while [ $attempts -lt $max_attempts ]; do
+    echo "${COLOR_YELLOW}${BOLD}Attempt $((attempts+1)): Deploying $function_name...${COLOR_RESET}"
+    if gcloud functions deploy "$function_name" --quiet "$@"; then
+      echo "${COLOR_GREEN}${BOLD}$function_name deployed successfully!${COLOR_RESET}"
       return 0
+    else
+      attempts=$((attempts+1))
+      echo "${COLOR_RED}${BOLD}Deployment failed. Retrying in 30 seconds...${COLOR_RESET}"
+      sleep 30
     fi
-    attempts=$((attempts+1))
-    echo "${COLOR_RED}${BOLD}Deployment failed. Retrying in 30 seconds...${COLOR_RESET}"
-    sleep 30
   done
-  echo "${COLOR_RED}${BOLD}Failed to deploy ${function_name} after ${max_attempts} attempts${COLOR_RESET}"
+  echo "${COLOR_RED}${BOLD}Failed to deploy $function_name after $max_attempts attempts${COLOR_RESET}"
   return 1
 }
 
-# ===== HTTP Function (Gen2) =====
+# Deploy HTTP Function
 echo
 echo "${COLOR_BLUE}${BOLD}Deploying HTTP Trigger Function...${COLOR_RESET}"
+echo
 mkdir -p ~/hello-http && cd ~/hello-http
 cat > index.js <<'EOF'
 const functions = require('@google-cloud/functions-framework');
 functions.http('helloWorld', (req, res) => {
-  res.status(200).send('HTTP with Node.js in GCF 2nd gen!');
+  res.status(200).send('HTTP with Node.js 22 in GCF 2nd gen!');
 });
 EOF
 cat > package.json <<'EOF'
@@ -113,14 +149,12 @@ cat > package.json <<'EOF'
 }
 EOF
 
-# Generate package-lock.json to speed up build & remove warning
+# Generate package-lock.json to improve build performance
 npm install --no-audit --no-fund
-
-RUNTIME_NODE="nodejs20"   # ganti ke nodejs22 jika region mendukung / lab mewajibkan
 
 deploy_with_retry nodejs-http-function \
   --gen2 \
-  --runtime "${RUNTIME_NODE}" \
+  --runtime nodejs22 \
   --entry-point helloWorld \
   --source . \
   --region "$REGION" \
@@ -129,21 +163,22 @@ deploy_with_retry nodejs-http-function \
   --max-instances 1 \
   --allow-unauthenticated
 
-# Test via URL untuk HTTP Gen2
-HTTP_URL="$(gcloud functions describe nodejs-http-function --gen2 --region "$REGION" --format='value(serviceConfig.uri)')"
-echo "${COLOR_CYAN}${BOLD}HTTP URL:${COLOR_RESET} ${HTTP_URL}"
-echo "${COLOR_CYAN}${BOLD}Curling the function...${COLOR_RESET}"
-curl -sS "${HTTP_URL}" || true
+# Test HTTP Function (gunakan curl untuk Gen2)
 echo
+echo "${COLOR_BLUE}${BOLD}Testing HTTP Function...${COLOR_RESET}"
+HTTP_URL="$(gcloud functions describe nodejs-http-function --gen2 --region "$REGION" --format='value(serviceConfig.uri)')"
+echo "URL: ${HTTP_URL}"
+curl -sS "${HTTP_URL}" || true
 
-# ===== Storage Trigger Function (idempotent & no unauth log spam) =====
+# Deploy Storage Function
 echo
 echo "${COLOR_BLUE}${BOLD}Deploying Storage Trigger Function...${COLOR_RESET}"
+echo
 mkdir -p ~/hello-storage && cd ~/hello-storage
 cat > index.js <<'EOF'
 const functions = require('@google-cloud/functions-framework');
 functions.cloudEvent('helloStorage', (cloudevent) => {
-  console.log('Cloud Storage event received in GCF 2nd gen!');
+  console.log('Cloud Storage event with Node.js 22 in GCF 2nd gen!');
   console.log(cloudevent);
 });
 EOF
@@ -158,19 +193,19 @@ cat > package.json <<'EOF'
 }
 EOF
 
-# Generate package-lock.json
+# Install deps to generate package-lock.json
 npm install --no-audit --no-fund
 
-# Bucket unik & idempotent
+# Gunakan bucket unik dan idempotent
 BUCKET_NAME="gcf-gen2-storage-${PROJECT_ID}-$(date +%s)"
 BUCKET_URI="gs://${BUCKET_NAME}"
 if ! gsutil ls -b "${BUCKET_URI}" >/dev/null 2>&1; then
-  gsutil mb -p "$PROJECT_ID" -l "$REGION" "${BUCKET_URI}"
+  gsutil mb -l "$REGION" "${BUCKET_URI}"
 fi
 
 deploy_with_retry nodejs-storage-function \
   --gen2 \
-  --runtime "${RUNTIME_NODE}" \
+  --runtime nodejs22 \
   --entry-point helloStorage \
   --source . \
   --region "$REGION" \
@@ -178,26 +213,28 @@ deploy_with_retry nodejs-storage-function \
   --trigger-location "$REGION" \
   --max-instances 1
 
-# Trigger test (tidak mengakses URL service secara langsung)
+# Test Storage Function trigger (unggah object)
 echo "Hello World" > random.txt
 gsutil cp random.txt "${BUCKET_URI}/random.txt"
-echo "${COLOR_BLUE}${BOLD}Reading recent logs for storage function...${COLOR_RESET}"
-gcloud functions logs read nodejs-storage-function --region "$REGION" --gen2 --limit=50 --format "value(log)" || true
-
-# ===== VM Labeler via Eventarc (idempotent VM) =====
 echo
-echo "${COLOR_BLUE}${BOLD}Deploying VM Labeler Function (Eventarc)...${COLOR_RESET}"
+echo "${COLOR_BLUE}${BOLD}Checking Storage Function Logs...${COLOR_RESET}"
+gcloud functions logs read nodejs-storage-function \
+  --region "$REGION" --gen2 --limit=100 --format "value(log)" || true
+
+# Deploy VM Labeler Function
+echo
+echo "${COLOR_BLUE}${BOLD}Deploying VM Labeler Function...${COLOR_RESET}"
+echo
 cd ~
 if [[ ! -d eventarc-samples ]]; then
   git clone https://github.com/GoogleCloudPlatform/eventarc-samples.git
 fi
 cd ~/eventarc-samples/gce-vm-labeler/gcf/nodejs
-# pastikan dependencies (kalau repo ini butuh)
 npm install --no-audit --no-fund || true
 
 deploy_with_retry gce-vm-labeler \
   --gen2 \
-  --runtime "${RUNTIME_NODE}" \
+  --runtime nodejs22 \
   --entry-point labelVmCreation \
   --source . \
   --region "$REGION" \
@@ -205,30 +242,150 @@ deploy_with_retry gce-vm-labeler \
   --trigger-location "$REGION" \
   --max-instances 1
 
-# Buat VM idempotent: hapus jika sudah ada, lalu buat ulang
+# Create Test VM (idempotent: delete if exists)
 echo
-echo "${COLOR_BLUE}${BOLD}Creating Test VM Instance (idempotent)...${COLOR_RESET}"
-VM_NAME="instance-1"
-if gcloud compute instances describe "${VM_NAME}" --zone "${ZONE}" >/dev/null 2>&1; then
-  echo "${COLOR_YELLOW}${BOLD}${VM_NAME} exists. Deleting first...${COLOR_RESET}"
-  gcloud compute instances delete "${VM_NAME}" --zone "${ZONE}" --quiet
+echo "${COLOR_BLUE}${BOLD}Creating Test VM Instance...${COLOR_RESET}"
+if gcloud compute instances describe instance-1 --zone "$ZONE" >/dev/null 2>&1; then
+  echo "${COLOR_YELLOW}${BOLD}instance-1 exists. Deleting first...${COLOR_RESET}"
+  gcloud compute instances delete instance-1 --zone "$ZONE" --quiet
 fi
 
-gcloud compute instances create "${VM_NAME}" \
-  --project="${PROJECT_ID}" \
-  --zone="${ZONE}" \
+gcloud compute instances create instance-1 --project="$PROJECT_ID" --zone="$ZONE" \
   --machine-type=e2-medium \
   --network-interface=network-tier=PREMIUM,stack-type=IPV4_ONLY,subnet=default \
   --metadata=enable-osconfig=TRUE,enable-oslogin=true \
   --maintenance-policy=MIGRATE \
   --provisioning-model=STANDARD \
-  --service-account="${COMPUTE_DEFAULT_SA}" \
-  --scopes="https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/trace.append" \
-  --create-disk=auto-delete=yes,boot=yes,device-name="${VM_NAME}",image=projects/debian-cloud/global/images/debian-12-bookworm-v20250311,mode=rw,size=10,type=pd-balanced \
+  --service-account="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
+  --scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/trace.append \
+  --create-disk=auto-delete=yes,boot=yes,device-name=instance-1,image=projects/debian-cloud/global/images/debian-12-bookworm-v20250311,mode=rw,size=10,type=pd-balanced \
   --no-shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
   --labels=goog-ops-agent-policy=v2-x86-template-1-4-0,goog-ec-src=vm_add-gcloud \
   --reservation-affinity=any
 
+printf 'agentsRule:\n  packageState: installed\n  version: latest\ninstanceFilter:\n  inclusionLabels:\n  - labels:\n      goog-ops-agent-policy: v2-x86-template-1-4-0\n' > config.yaml
+
+gcloud compute instances ops-agents policies create "goog-ops-agent-v2-x86-template-1-4-0-$ZONE" \
+  --project="$PROJECT_ID" --zone="$ZONE" --file=config.yaml || true
+
+gcloud compute resource-policies create snapshot-schedule default-schedule-1 \
+  --project="$PROJECT_ID" --region="$REGION" --max-retention-days=14 \
+  --on-source-disk-delete=keep-auto-snapshots --daily-schedule --start-time=08:00 || true
+
+gcloud compute disks add-resource-policies instance-1 --project="$PROJECT_ID" --zone="$ZONE" \
+  --resource-policies="projects/$PROJECT_ID/regions/$REGION/resourcePolicies/default-schedule-1" || true
+
+# Describe VM
 echo
-echo "${COLOR_CYAN}${BOLD}Done. HTTP function URL:${COLOR_RESET} ${HTTP_URL}"
-echo "${COLOR_GREEN}${BOLD}Deployments completed (HTTP, Storage trigger, VM labeler).${COLOR_RESET}"
+echo "${COLOR_BLUE}${BOLD}Checking VM Details...${COLOR_RESET}"
+gcloud compute instances describe instance-1 --zone "$ZONE" | head -n 50
+
+# Deploy Colored Function
+echo
+echo "${COLOR_BLUE}${BOLD}Deploying Colored Hello World Function...${COLOR_RESET}"
+echo
+mkdir -p ~/hello-world-colored && cd ~/hello-world-colored
+: > requirements.txt
+cat > main.py <<'EOF'
+import os
+color = os.environ.get('COLOR')
+def hello_world(request):
+    return f'<body style="background-color:{color}"><h1>Hello World!</h1></body>'
+EOF
+
+deploy_with_retry hello-world-colored \
+  --gen2 \
+  --runtime python39 \
+  --entry-point hello_world \
+  --source . \
+  --region "$REGION" \
+  --trigger-http \
+  --allow-unauthenticated \
+  --update-env-vars COLOR=yellow \
+  --max-instances 1
+
+# Deploy Slow Go Function
+echo
+echo "${COLOR_BLUE}${BOLD}Deploying Slow Go Function...${COLOR_RESET}"
+echo
+mkdir -p ~/min-instances && cd ~/min-instances
+cat > main.go <<'EOF'
+package p
+import (
+        "fmt"
+        "net/http"
+        "time"
+)
+func init() {
+        time.Sleep(10 * time.Second)
+}
+func HelloWorld(w http.ResponseWriter, r *http.Request) {
+        fmt.Fprint(w, "Slow HTTP Go in GCF 2nd gen!")
+}
+EOF
+echo "module example.com/mod" > go.mod
+
+deploy_with_retry slow-function \
+  --gen2 \
+  --runtime go123 \
+  --entry-point HelloWorld \
+  --source . \
+  --region "$REGION" \
+  --trigger-http \
+  --allow-unauthenticated \
+  --max-instances 4
+
+# Test Slow Function
+echo
+echo "${COLOR_BLUE}${BOLD}Testing Slow Function...${COLOR_RESET}"
+gcloud functions call slow-function --gen2 --region "$REGION" || true
+
+# Deploy as Cloud Run Service
+echo
+echo "${COLOR_BLUE}${BOLD}Deploying as Cloud Run Service...${COLOR_RESET}"
+
+# Progress Check
+function check_progress {
+    while true; do
+        echo
+        echo "${COLOR_CYAN}${BOLD} ------ PLEASE COMPLETE MANUAL STEP AND VERIFY YOUR PROGRESS UP TO TASK 6 ${COLOR_RESET}"
+        echo
+        read -p "${COLOR_BLUE}${BOLD}Have you completed Task 6? (Y/N): ${COLOR_RESET}" user_input
+        case $user_input in
+            [Yy]*) echo; echo "${COLOR_GREEN}${BOLD}Proceeding to next steps...${COLOR_RESET}"; echo; break;;
+            [Nn]*) echo; echo "${COLOR_RED}${BOLD}Please complete Task 6 first${COLOR_RESET}";;
+            *)     echo; echo "Invalid input. Please enter Y or N.";;
+        esac
+    done
+}
+check_progress
+
+# Cleanup
+echo
+echo "${COLOR_BLUE}${BOLD}Cleaning Up Previous Deployment...${COLOR_RESET}"
+gcloud run services delete slow-function --region "$REGION" --quiet || true
+
+# Deploy Concurrent Function
+echo
+echo "${COLOR_BLUE}${BOLD}Deploying Concurrent Function...${COLOR_RESET}"
+deploy_with_retry slow-concurrent-function \
+  --gen2 \
+  --runtime go123 \
+  --entry-point HelloWorld \
+  --source . \
+  --region "$REGION" \
+  --trigger-http \
+  --allow-unauthenticated \
+  --min-instances 1 \
+  --max-instances 4
+
+echo "${COLOR_CYAN}${BOLD} ------ PLEASE COMPLETE MANUAL STEP AND VERIFY YOUR PROGRESS OF TASK 7 ${COLOR_RESET}"
+
+# Final message
+echo
+echo "${COLOR_GREEN}${BOLD}=======================================================${COLOR_RESET}"
+echo "${COLOR_GREEN}${BOLD}              LAB COMPLETED SUCCESSFULLY!              ${COLOR_RESET}"
+echo "${COLOR_GREEN}${BOLD}=======================================================${COLOR_RESET}"
+echo
+echo "${COLOR_RED}${BOLD}${UNDERLINE}https://www.youtube.com/@TechCode9${COLOR_RESET}"
+echo
