@@ -48,16 +48,12 @@ echo "${COLOR_BLUE}${BOLD}Configuring IAM for build & logging...${COLOR_RESET}"
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
   --role roles/cloudbuild.builds.builder || true
-
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
   --role roles/artifactregistry.writer || true
-
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
   --role roles/logging.logWriter || true
-
-# Eventarc receiver (dibutuhkan bila pakai trigger audit log nantinya)
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
   --role roles/eventarc.eventReceiver || true
@@ -117,8 +113,10 @@ cat > package.json <<'EOF'
 }
 EOF
 
-# Gunakan runtime stabil (nodejs20). Ganti ke nodejs22 jika memang tersedia di regionmu.
-RUNTIME_NODE="nodejs20"
+# Generate package-lock.json to speed up build & remove warning
+npm install --no-audit --no-fund
+
+RUNTIME_NODE="nodejs20"   # ganti ke nodejs22 jika region mendukung / lab mewajibkan
 
 deploy_with_retry nodejs-http-function \
   --gen2 \
@@ -131,14 +129,14 @@ deploy_with_retry nodejs-http-function \
   --max-instances 1 \
   --allow-unauthenticated
 
-# Test via URL (lebih tepat untuk HTTP Gen2 daripada 'gcloud functions call')
+# Test via URL untuk HTTP Gen2
 HTTP_URL="$(gcloud functions describe nodejs-http-function --gen2 --region "$REGION" --format='value(serviceConfig.uri)')"
 echo "${COLOR_CYAN}${BOLD}HTTP URL:${COLOR_RESET} ${HTTP_URL}"
 echo "${COLOR_CYAN}${BOLD}Curling the function...${COLOR_RESET}"
 curl -sS "${HTTP_URL}" || true
 echo
 
-# ===== Storage Trigger Function (tetap ada; bukan “slow”) =====
+# ===== Storage Trigger Function (idempotent & no unauth log spam) =====
 echo
 echo "${COLOR_BLUE}${BOLD}Deploying Storage Trigger Function...${COLOR_RESET}"
 mkdir -p ~/hello-storage && cd ~/hello-storage
@@ -160,8 +158,15 @@ cat > package.json <<'EOF'
 }
 EOF
 
-BUCKET="gs://gcf-gen2-storage-${PROJECT_ID}"
-gsutil mb -p "$PROJECT_ID" -l "$REGION" "$BUCKET" || true
+# Generate package-lock.json
+npm install --no-audit --no-fund
+
+# Bucket unik & idempotent
+BUCKET_NAME="gcf-gen2-storage-${PROJECT_ID}-$(date +%s)"
+BUCKET_URI="gs://${BUCKET_NAME}"
+if ! gsutil ls -b "${BUCKET_URI}" >/dev/null 2>&1; then
+  gsutil mb -p "$PROJECT_ID" -l "$REGION" "${BUCKET_URI}"
+fi
 
 deploy_with_retry nodejs-storage-function \
   --gen2 \
@@ -169,17 +174,17 @@ deploy_with_retry nodejs-storage-function \
   --entry-point helloStorage \
   --source . \
   --region "$REGION" \
-  --trigger-bucket "$BUCKET" \
+  --trigger-bucket "${BUCKET_NAME}" \
   --trigger-location "$REGION" \
   --max-instances 1
 
-# Trigger test
+# Trigger test (tidak mengakses URL service secara langsung)
 echo "Hello World" > random.txt
-gsutil cp random.txt "${BUCKET}/random.txt"
+gsutil cp random.txt "${BUCKET_URI}/random.txt"
 echo "${COLOR_BLUE}${BOLD}Reading recent logs for storage function...${COLOR_RESET}"
 gcloud functions logs read nodejs-storage-function --region "$REGION" --gen2 --limit=50 --format "value(log)" || true
 
-# ===== (Opsional) VM Labeler via Eventarc — tetap ada & bukan “slow” =====
+# ===== VM Labeler via Eventarc (idempotent VM) =====
 echo
 echo "${COLOR_BLUE}${BOLD}Deploying VM Labeler Function (Eventarc)...${COLOR_RESET}"
 cd ~
@@ -187,6 +192,9 @@ if [[ ! -d eventarc-samples ]]; then
   git clone https://github.com/GoogleCloudPlatform/eventarc-samples.git
 fi
 cd ~/eventarc-samples/gce-vm-labeler/gcf/nodejs
+# pastikan dependencies (kalau repo ini butuh)
+npm install --no-audit --no-fund || true
+
 deploy_with_retry gce-vm-labeler \
   --gen2 \
   --runtime "${RUNTIME_NODE}" \
@@ -197,10 +205,16 @@ deploy_with_retry gce-vm-labeler \
   --trigger-location "$REGION" \
   --max-instances 1
 
-# Buat 1 VM untuk menguji labeler
+# Buat VM idempotent: hapus jika sudah ada, lalu buat ulang
 echo
-echo "${COLOR_BLUE}${BOLD}Creating Test VM Instance...${COLOR_RESET}"
-gcloud compute instances create instance-1 \
+echo "${COLOR_BLUE}${BOLD}Creating Test VM Instance (idempotent)...${COLOR_RESET}"
+VM_NAME="instance-1"
+if gcloud compute instances describe "${VM_NAME}" --zone "${ZONE}" >/dev/null 2>&1; then
+  echo "${COLOR_YELLOW}${BOLD}${VM_NAME} exists. Deleting first...${COLOR_RESET}"
+  gcloud compute instances delete "${VM_NAME}" --zone "${ZONE}" --quiet
+fi
+
+gcloud compute instances create "${VM_NAME}" \
   --project="${PROJECT_ID}" \
   --zone="${ZONE}" \
   --machine-type=e2-medium \
@@ -210,11 +224,11 @@ gcloud compute instances create instance-1 \
   --provisioning-model=STANDARD \
   --service-account="${COMPUTE_DEFAULT_SA}" \
   --scopes="https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/trace.append" \
-  --create-disk=auto-delete=yes,boot=yes,device-name=instance-1,image=projects/debian-cloud/global/images/debian-12-bookworm-v20250311,mode=rw,size=10,type=pd-balanced \
+  --create-disk=auto-delete=yes,boot=yes,device-name="${VM_NAME}",image=projects/debian-cloud/global/images/debian-12-bookworm-v20250311,mode=rw,size=10,type=pd-balanced \
   --no-shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
   --labels=goog-ops-agent-policy=v2-x86-template-1-4-0,goog-ec-src=vm_add-gcloud \
   --reservation-affinity=any
 
 echo
 echo "${COLOR_CYAN}${BOLD}Done. HTTP function URL:${COLOR_RESET} ${HTTP_URL}"
-echo "${COLOR_GREEN}${BOLD}All done without deploying any 'slow' functions.${COLOR_RESET}"
+echo "${COLOR_GREEN}${BOLD}Deployments completed (HTTP, Storage trigger, VM labeler).${COLOR_RESET}"
