@@ -19,7 +19,7 @@ BLINK=$'\033[5m'
 REVERSE=$'\033[7m'
 
 clear
-# Welcome message (fix undefined vars)
+# Welcome message
 echo "${COLOR_BLUE}${BOLD}=======================================${COLOR_RESET}"
 echo "${COLOR_BLUE}${BOLD}         INITIATING EXECUTION...       ${COLOR_RESET}"
 echo "${COLOR_BLUE}${BOLD}=======================================${COLOR_RESET}"
@@ -44,7 +44,7 @@ PROJECT_NUMBER="$(gcloud projects list --filter="project_id:${PROJECT_ID}" --for
 export ZONE="$(gcloud compute project-info describe --format="value(commonInstanceMetadata.items[google-compute-default-zone])")"
 export REGION="$(gcloud compute project-info describe --format="value(commonInstanceMetadata.items[google-compute-default-region])")"
 
-# Fallback REGION/ZONE bila metadata kosong
+# Fallback REGION/ZONE kalau kosong
 if [[ -z "${REGION}" || -z "${ZONE}" ]]; then
   ZONE="${ZONE:-$(gcloud config get-value compute/zone 2>/dev/null || true)}"
   REGION="${REGION:-$(gcloud config get-value compute/region 2>/dev/null || true)}"
@@ -52,14 +52,13 @@ if [[ -z "${REGION}" || -z "${ZONE}" ]]; then
   REGION="${REGION:-us-central1}"
   ZONE="${ZONE:-${REGION}-a}"
 fi
-
 gcloud config set compute/region "$REGION" >/dev/null
 gcloud config set compute/zone "$ZONE" >/dev/null
 
 COMPUTE_DEFAULT_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 EVENTARC_SA="service-${PROJECT_NUMBER}@gcp-sa-eventarc.iam.gserviceaccount.com"
 
-# Configure IAM (existing + fixes)
+# Configure IAM (tambahan yang perlu)
 SERVICE_ACCOUNT="$(gsutil kms serviceaccount -p "${PROJECT_NUMBER}" 2>/dev/null || true)"
 if [[ -n "${SERVICE_ACCOUNT}" ]]; then
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
@@ -67,12 +66,10 @@ if [[ -n "${SERVICE_ACCOUNT}" ]]; then
     --role roles/pubsub.publisher || true
 fi
 
-# Eventarc receiver for Compute Default SA (as in your script)
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
   --role roles/eventarc.eventReceiver || true
 
-# === Fixes for build/logging/AR writer on Compute Default SA ===
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
   --role roles/logging.logWriter || true
@@ -83,7 +80,7 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member "serviceAccount:${COMPUTE_DEFAULT_SA}" \
   --role roles/artifactregistry.writer || true
 
-# === Eventarc Service Agent hardening ===
+# Eventarc Service Agent hardening
 gcloud projects add-iam-policy-binding "$PROJECT_ID" \
   --member="serviceAccount:${EVENTARC_SA}" \
   --role="roles/eventarc.serviceAgent" --quiet || true
@@ -93,7 +90,6 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" \
 
 # Update IAM Policy (Audit logs for compute.googleapis.com)
 gcloud projects get-iam-policy "$PROJECT_ID" > policy.yaml
-# Tambah auditConfigs jika belum ada (append aman)
 if ! grep -q "service: compute.googleapis.com" policy.yaml; then
 cat <<'EOF' >> policy.yaml
 auditConfigs:
@@ -106,7 +102,7 @@ EOF
 fi
 gcloud projects set-iam-policy "$PROJECT_ID" policy.yaml >/dev/null
 
-# Helper deploy (pakai --quiet)
+# Helper deploy
 deploy_with_retry() {
   local function_name=$1
   shift
@@ -149,7 +145,6 @@ cat > package.json <<'EOF'
 }
 EOF
 
-# Generate package-lock.json to improve build performance
 npm install --no-audit --no-fund
 
 deploy_with_retry nodejs-http-function \
@@ -163,7 +158,7 @@ deploy_with_retry nodejs-http-function \
   --max-instances 1 \
   --allow-unauthenticated
 
-# Test HTTP Function (gunakan curl untuk Gen2)
+# Test HTTP Function (curl untuk Gen2)
 echo
 echo "${COLOR_BLUE}${BOLD}Testing HTTP Function...${COLOR_RESET}"
 HTTP_URL="$(gcloud functions describe nodejs-http-function --gen2 --region "$REGION" --format='value(serviceConfig.uri)')"
@@ -193,10 +188,9 @@ cat > package.json <<'EOF'
 }
 EOF
 
-# Install deps to generate package-lock.json
 npm install --no-audit --no-fund
 
-# Gunakan bucket unik dan idempotent
+# Bucket unik
 BUCKET_NAME="gcf-gen2-storage-${PROJECT_ID}-$(date +%s)"
 BUCKET_URI="gs://${BUCKET_NAME}"
 if ! gsutil ls -b "${BUCKET_URI}" >/dev/null 2>&1; then
@@ -213,7 +207,7 @@ deploy_with_retry nodejs-storage-function \
   --trigger-location "$REGION" \
   --max-instances 1
 
-# Test Storage Function trigger (unggah object)
+# Test Storage trigger
 echo "Hello World" > random.txt
 gsutil cp random.txt "${BUCKET_URI}/random.txt"
 echo
@@ -242,7 +236,7 @@ deploy_with_retry gce-vm-labeler \
   --trigger-location "$REGION" \
   --max-instances 1
 
-# Create Test VM (idempotent: delete if exists)
+# Create Test VM (idempotent)
 echo
 echo "${COLOR_BLUE}${BOLD}Creating Test VM Instance...${COLOR_RESET}"
 if gcloud compute instances describe instance-1 --zone "$ZONE" >/dev/null 2>&1; then
@@ -258,7 +252,7 @@ gcloud compute instances create instance-1 --project="$PROJECT_ID" --zone="$ZONE
   --provisioning-model=STANDARD \
   --service-account="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com" \
   --scopes=https://www.googleapis.com/auth/devstorage.read_only,https://www.googleapis.com/auth/logging.write,https://www.googleapis.com/auth/monitoring.write,https://www.googleapis.com/auth/service.management.readonly,https://www.googleapis.com/auth/servicecontrol,https://www.googleapis.com/auth/trace.append \
-  --create-disk=auto-delete=yes,boot=yes,device-name=instance-1,image=projects/debian-cloud/global/images/debian-12-bookworm-v20250311,mode=rw,size=10,type=pd-balanced \
+  --create-disk=auto-delete=yes,boot=yes,device-name=instance-1,image=projects/debian-cloud/global/images/family/debian-12,mode=rw,size=10,type=pd-balanced \
   --no-shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
   --labels=goog-ops-agent-policy=v2-x86-template-1-4-0,goog-ec-src=vm_add-gcloud \
   --reservation-affinity=any
@@ -280,7 +274,7 @@ echo
 echo "${COLOR_BLUE}${BOLD}Checking VM Details...${COLOR_RESET}"
 gcloud compute instances describe instance-1 --zone "$ZONE" | head -n 50
 
-# Deploy Colored Function
+# Deploy Colored Function (Python 3.11)
 echo
 echo "${COLOR_BLUE}${BOLD}Deploying Colored Hello World Function...${COLOR_RESET}"
 echo
@@ -288,14 +282,14 @@ mkdir -p ~/hello-world-colored && cd ~/hello-world-colored
 : > requirements.txt
 cat > main.py <<'EOF'
 import os
-color = os.environ.get('COLOR')
+color = os.environ.get('COLOR', 'white')
 def hello_world(request):
     return f'<body style="background-color:{color}"><h1>Hello World!</h1></body>'
 EOF
 
 deploy_with_retry hello-world-colored \
   --gen2 \
-  --runtime python39 \
+  --runtime python311 \
   --entry-point hello_world \
   --source . \
   --region "$REGION" \
@@ -335,28 +329,21 @@ deploy_with_retry slow-function \
   --allow-unauthenticated \
   --max-instances 4
 
-# Test Slow Function
+# Test Slow Function (curl HTTP Gen2)
 echo
 echo "${COLOR_BLUE}${BOLD}Testing Slow Function...${COLOR_RESET}"
-gcloud functions call slow-function --gen2 --region "$REGION" || true
+SLOW_URL="$(gcloud functions describe slow-function --gen2 --region "$REGION" --format='value(serviceConfig.uri)')"
+curl -sS "${SLOW_URL}" || true
 
 # Deploy as Cloud Run Service
 echo
 echo "${COLOR_BLUE}${BOLD}Deploying as Cloud Run Service...${COLOR_RESET}"
 
-# Progress Check
-function check_progress {
-    while true; do
-        echo
-        echo "${COLOR_CYAN}${BOLD} ------ PLEASE COMPLETE MANUAL STEP AND VERIFY YOUR PROGRESS UP TO TASK 6 ${COLOR_RESET}"
-        echo
-        read -p "${COLOR_BLUE}${BOLD}Have you completed Task 6? (Y/N): ${COLOR_RESET}" user_input
-        case $user_input in
-            [Yy]*) echo; echo "${COLOR_GREEN}${BOLD}Proceeding to next steps...${COLOR_RESET}"; echo; break;;
-            [Nn]*) echo; echo "${COLOR_RED}${BOLD}Please complete Task 6 first${COLOR_RESET}";;
-            *)     echo; echo "Invalid input. Please enter Y or N.";;
-        esac
-    done
+# Progress Check (NON-INTERACTIVE)
+check_progress() {
+  echo
+  echo "${COLOR_CYAN}${BOLD} -- AUTO-CONTINUE: skipping manual prompt (Task 6) -- ${COLOR_RESET}"
+  echo
 }
 check_progress
 
